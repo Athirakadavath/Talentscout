@@ -3,28 +3,183 @@ TalentScout Hiring Assistant Chatbot
 
 This module provides the core functionality for the TalentScout Hiring Assistant,
 a chatbot that helps in the initial screening of tech candidates.
+Enhanced with database storage capabilities.
 """
 
 import os
 import re
 import json
+import logging
+import requests
+import sqlite3
 from typing import Dict, List, Any, Optional, Union
 from datetime import datetime
-import logging
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Set up logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO,
+                   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Determine OpenAI SDK version and import appropriately
-try:
-    from openai import OpenAI
-    USING_NEW_SDK = True
-    logger.info("Using new OpenAI SDK")
-except ImportError:
-    import openai
-    USING_NEW_SDK = False
-    logger.info("Using legacy OpenAI SDK")
+
+class CandidateDatabase:
+    """Database handler for storing candidate information"""
+    def __init__(self, db_path="candidates.db"):
+        self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self):
+        """Initialize the database schema if it doesn't exist"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        # Create candidates table
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS candidates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            email TEXT UNIQUE,
+            phone TEXT,
+            experience TEXT,
+            position TEXT,
+            location TEXT,
+            tech_stack TEXT,
+            application_time TIMESTAMP,
+            status TEXT DEFAULT 'new',
+            conversation_history TEXT,
+            notes TEXT
+        )
+        ''')
+
+        conn.commit()
+        conn.close()
+        logger.info(f"Database initialized at {self.db_path}")
+
+    def save_candidate(self, candidate_info, conversation_history=None):
+        """Save candidate information to database"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        # Convert tech_stack list to JSON string
+        if isinstance(candidate_info.get('tech_stack', []), list):
+            tech_stack_json = json.dumps(candidate_info.get('tech_stack', []))
+        else:
+            tech_stack_json = json.dumps([])
+
+        # Convert conversation history to JSON string
+        if conversation_history:
+            conv_history_json = json.dumps(conversation_history)
+        else:
+            conv_history_json = json.dumps([])
+
+        try:
+            cursor.execute('''
+            INSERT INTO candidates
+            (name, email, phone, experience, position, location, tech_stack,
+            application_time, conversation_history)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                candidate_info.get('name', ''),
+                candidate_info.get('email', ''),
+                candidate_info.get('phone', ''),
+                candidate_info.get('experience', ''),
+                candidate_info.get('position', ''),
+                candidate_info.get('location', ''),
+                tech_stack_json,
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                conv_history_json
+            ))
+
+            conn.commit()
+            candidate_id = cursor.lastrowid
+            logger.info(f"Saved candidate with ID {candidate_id}")
+            result = {"success": True, "candidate_id": candidate_id}
+        except sqlite3.IntegrityError as e:
+            # Handle duplicate email
+            logger.error(f"Database error saving candidate: {e}")
+            result = {"success": False, "error": "Candidate with this email already exists"}
+        finally:
+            conn.close()
+
+        return result
+
+    def get_candidate_by_email(self, email):
+        """Retrieve candidate by email"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row  # Return rows as dictionaries
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT * FROM candidates WHERE email = ?", (email,))
+        result = cursor.fetchone()
+
+        conn.close()
+
+        if result:
+            # Parse JSON fields
+            candidate = dict(result)
+            candidate['tech_stack'] = json.loads(candidate['tech_stack'])
+            candidate['conversation_history'] = json.loads(candidate['conversation_history'])
+            return candidate
+        return None
+
+    def get_candidate_by_id(self, candidate_id):
+        """Retrieve candidate by ID"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row  # Return rows as dictionaries
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT * FROM candidates WHERE id = ?", (candidate_id,))
+        result = cursor.fetchone()
+
+        conn.close()
+
+        if result:
+            # Parse JSON fields
+            candidate = dict(result)
+            candidate['tech_stack'] = json.loads(candidate['tech_stack'])
+            candidate['conversation_history'] = json.loads(candidate['conversation_history'])
+            return candidate
+        return None
+
+    def update_candidate_status(self, candidate_id, status, notes=None):
+        """Update candidate status and notes"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        if notes:
+            cursor.execute(
+                "UPDATE candidates SET status = ?, notes = ? WHERE id = ?",
+                (status, notes, candidate_id)
+            )
+        else:
+            cursor.execute(
+                "UPDATE candidates SET status = ? WHERE id = ?",
+                (status, candidate_id)
+            )
+
+        conn.commit()
+        conn.close()
+        logger.info(f"Updated candidate {candidate_id} status to {status}")
+        return True
+
+    def list_recent_candidates(self, limit=50):
+        """List recent candidates"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        cursor.execute('''
+        SELECT id, name, email, position, application_time, status
+        FROM candidates ORDER BY application_time DESC LIMIT ?
+        ''', (limit,))
+
+        candidates = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+
+        return candidates
 
 
 class TalentScoutBot:
@@ -37,11 +192,17 @@ class TalentScoutBot:
 
     def __init__(self):
         """Initialize the TalentScout bot with default settings."""
-        # Set up OpenAI client
-        if USING_NEW_SDK:
-            self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        # Set up Gemini API
+        self.api_key = os.getenv("GEMINI_API_KEY")
+        if not self.api_key:
+            logger.warning("No Gemini API key found in environment variables")
+            self.api_working = False
         else:
-            openai.api_key = os.getenv("OPENAI_API_KEY")
+            self.api_working = True
+            logger.info("Gemini API initialized")
+
+        # Initialize database
+        self.db = CandidateDatabase()
 
         # Initialize conversation state
         self.current_stage = "greeting"
@@ -68,93 +229,173 @@ class TalentScoutBot:
             "closing"
         ]
 
+        # Tech stack categories for better question generation
+        self.tech_categories = {
+            "languages": [
+                "python", "java", "javascript", "typescript", "c#", "c++", "ruby",
+                "go", "rust", "php", "swift", "kotlin", "scala", "perl", "haskell"
+            ],
+            "frontend": [
+                "react", "angular", "vue", "svelte", "html", "css", "sass", "less",
+                "bootstrap", "tailwind", "jquery", "webpack", "next.js", "gatsby"
+            ],
+            "backend": [
+                "node", "express", "django", "flask", "spring", "asp.net", "laravel",
+                "ruby on rails", "fastapi", "nestjs", "graphql", "rest", "soap"
+            ],
+            "databases": [
+                "sql", "mysql", "postgresql", "mongodb", "firebase", "oracle", "sqlite",
+                "redis", "elasticsearch", "dynamodb", "cassandra", "neo4j", "couchdb"
+            ],
+            "cloud": [
+                "aws", "azure", "gcp", "cloud", "docker", "kubernetes", "serverless",
+                "lambda", "ec2", "s3", "heroku", "netlify", "vercel"
+            ],
+            "mobile": [
+                "android", "ios", "react native", "flutter", "xamarin", "swift", "kotlin",
+                "objective-c", "mobile development"
+            ],
+            "devops": [
+                "jenkins", "github actions", "gitlab ci", "travis", "docker", "kubernetes",
+                "terraform", "ansible", "puppet", "chef", "ci/cd", "devops"
+            ],
+            "ai_ml": [
+                "machine learning", "deep learning", "ai", "tensorflow", "pytorch", "keras",
+                "scikit-learn", "nlp", "computer vision", "data science"
+            ],
+            "testing": [
+                "junit", "pytest", "jest", "mocha", "cypress", "selenium", "testing",
+                "tdd", "bdd", "qa"
+            ]
+        }
+
         logger.info("TalentScoutBot initialized")
 
     def get_greeting(self) -> str:
         """Generate initial greeting message."""
-        return """
-        Hello! I'm the TalentScout Hiring Assistant. 👋
+        return "Hello! I'm the TalentScout Hiring Assistant. 👋\n\nI'm here to help with your initial screening process for tech positions.\nI'll ask you a few questions about your background and technical skills.\n\nLet's start with your name. What is your full name?"
 
-        I'm here to help with your initial screening process for tech positions.
-        I'll ask you a few questions about your background and technical skills.
-
-        Let's start with your name. What is your full name?
-        """
-
-    def process_message(self, user_message: str, message_history: List[Dict[str, str]],
-                      candidate_info: Dict[str, Any], conversation_stage: str) -> str:
+    def process_message(self, user_message: str, message_history: List[Dict[str, str]] = None) -> Dict[str, Any]:
         """
         Process incoming user message and generate a response.
 
         Args:
             user_message: The message from the user
             message_history: Previous messages in the conversation
-            candidate_info: Dictionary containing candidate information
-            conversation_stage: Current stage of the conversation
 
         Returns:
-            str: Response from the bot
+            Dict containing response text and updated state
         """
-        # Update internal state
-        self.candidate_info = candidate_info
-        self.current_stage = conversation_stage
+        # Initialize message history if None
+        if message_history is None:
+            message_history = []
+
+        # Extract conversation state if available in message history
+        if message_history and len(message_history) > 0:
+            # Try to find the latest state in message history
+            for message in reversed(message_history):
+                if message.get("metadata") and message["metadata"].get("conversation_stage"):
+                    self.current_stage = message["metadata"]["conversation_stage"]
+                    if message["metadata"].get("candidate_info"):
+                        self.candidate_info = message["metadata"]["candidate_info"]
+                    break
 
         logger.info(f"Processing message in stage: {self.current_stage}")
 
         # Check for exit keywords
         if self._is_exit_request(user_message):
             self.current_stage = "closing"
-            return self._generate_closing_message()
+            response = self._generate_closing_message(message_history)
+            result = {
+                "response": response,
+                "stage": "closing",
+                "candidate_info": self.candidate_info,
+                "completed": True
+            }
+
+            # Save candidate data if we have required info
+            if (self.current_stage == "closing" and
+                self.candidate_info.get("name") and
+                self.candidate_info.get("email")):
+                self.save_candidate(message_history)
+
+            return result
 
         # Process message based on current stage
         if self.current_stage == "greeting" or self.current_stage == "name":
             self._extract_name(user_message)
             if self.candidate_info["name"]:
                 self.current_stage = "contact_info"
-                return self._generate_contact_request_message()
+                response = self._generate_contact_request_message()
             else:
-                return "I didn't quite catch your name. Could you please provide your full name?"
+                response = "I didn't quite catch your name. Could you please provide your full name?"
 
         elif self.current_stage == "contact_info":
             self._extract_contact_info(user_message)
             if self.candidate_info["email"] and self.candidate_info["phone"]:
                 self.current_stage = "experience"
-                return self._generate_experience_request_message()
+                response = self._generate_experience_request_message()
             else:
                 missing = []
                 if not self.candidate_info["email"]:
                     missing.append("email address")
                 if not self.candidate_info["phone"]:
                     missing.append("phone number")
-                return f"I still need your {' and '.join(missing)}. Could you provide that information?"
+                response = f"I still need your {' and '.join(missing)}. Could you provide that information?"
 
         elif self.current_stage == "experience":
             self._extract_experience(user_message)
             self.current_stage = "position"
-            return self._generate_position_request_message()
+            response = self._generate_position_request_message()
 
         elif self.current_stage == "position":
             self._extract_position(user_message)
             self.current_stage = "location"
-            return self._generate_location_request_message()
+            response = self._generate_location_request_message()
 
         elif self.current_stage == "location":
             self._extract_location(user_message)
             self.current_stage = "tech_stack"
-            return self._generate_tech_stack_request_message()
+            response = self._generate_tech_stack_request_message()
 
         elif self.current_stage == "tech_stack":
             self._extract_tech_stack(user_message)
             self.current_stage = "technical_questions"
-            return self._generate_technical_questions()
+            response = self._generate_technical_questions()
 
         elif self.current_stage == "technical_questions":
             # After receiving answers to technical questions, we move to closing
             self.current_stage = "closing"
-            return self._generate_closing_message()
+            response = self._generate_closing_message(message_history)
 
-        # Default response using LLM
-        return self._generate_llm_response(user_message, message_history)
+            # Save candidate data
+            if self.candidate_info.get("name") and self.candidate_info.get("email"):
+                self.save_candidate(message_history)
+        else:
+            # Default response using LLM
+            response = self._generate_llm_response(user_message, message_history)
+
+        # Return response and updated state
+        result = {
+            "response": response,
+            "stage": self.current_stage,
+            "candidate_info": self.candidate_info,
+            "completed": (self.current_stage == "closing")
+        }
+
+        return result
+
+    def save_candidate(self, message_history):
+        """Save candidate information to database"""
+        # Save candidate to database
+        save_result = self.db.save_candidate(self.candidate_info, message_history)
+
+        if save_result["success"]:
+            logger.info(f"Candidate saved with ID {save_result['candidate_id']}")
+            return True
+        else:
+            logger.error(f"Failed to save candidate: {save_result.get('error')}")
+            return False
 
     def _is_exit_request(self, message: str) -> bool:
         """Check if user wants to end the conversation."""
@@ -217,21 +458,10 @@ class TalentScoutBot:
 
     def _extract_tech_stack(self, message: str) -> None:
         """Extract tech stack from user message."""
-        # Common technologies to look for
-        tech_keywords = [
-            # Languages
-            "python", "java", "javascript", "typescript", "c#", "c++", "ruby", "go", "rust", "php", "swift", "kotlin",
-            # Frontend
-            "react", "angular", "vue", "svelte", "html", "css", "sass", "bootstrap", "tailwind", "jquery",
-            # Backend
-            "node", "express", "django", "flask", "spring", "asp.net", "laravel", "ruby on rails", "fastapi",
-            # Databases
-            "sql", "mysql", "postgresql", "mongodb", "firebase", "oracle", "sqlite", "redis", "elasticsearch",
-            # Cloud
-            "aws", "azure", "gcp", "cloud", "docker", "kubernetes", "serverless", "lambda",
-            # Other
-            "machine learning", "ai", "devops", "git", "github", "gitlab", "ci/cd", "agile", "scrum"
-        ]
+        # Common technologies to look for - combined from tech_categories
+        tech_keywords = []
+        for category in self.tech_categories.values():
+            tech_keywords.extend(category)
 
         # First try to split by commas if the format seems to be a comma-separated list
         if "," in message:
@@ -256,60 +486,61 @@ class TalentScoutBot:
                 self.candidate_info["tech_stack"] = found_tech
                 logger.info(f"Extracted tech stack (keyword method): {found_tech}")
             else:
-                # Otherwise, use the LLM to extract tech stack
-                self.candidate_info["tech_stack"] = self._extract_tech_stack_with_llm(message)
-                logger.info(f"Extracted tech stack (LLM method): {self.candidate_info['tech_stack']}")
+                # Otherwise, use the LLM to extract tech stack if API is working
+                if self.api_working:
+                    try:
+                        self.candidate_info["tech_stack"] = self._extract_tech_stack_with_llm(message)
+                        logger.info(f"Extracted tech stack (LLM method): {self.candidate_info['tech_stack']}")
+                    except Exception as e:
+                        logger.error(f"Error extracting tech stack with LLM: {e}")
+                        # Fallback to simple word extraction
+                        self.candidate_info["tech_stack"] = [message.strip()]
+                else:
+                    # Simple fallback if API is not working
+                    self.candidate_info["tech_stack"] = [message.strip()]
+                    logger.info(f"Saved tech stack as single item: {message.strip()}")
 
     def _extract_tech_stack_with_llm(self, message: str) -> List[str]:
-        """Use LLM to extract tech stack items from a message."""
-        prompt = [
-            {
-                "role": "system",
-                "content": """
-                You are a helpful assistant that extracts technology keywords from text.
-                Output ONLY a Python list of technology names, with no other text or explanation.
-                For example: ['Python', 'React', 'AWS', 'PostgreSQL']
-                """
-            },
-            {
-                "role": "user",
-                "content": f"Extract technology keywords from this text: {message}"
-            }
-        ]
+        """Use Gemini API to extract tech stack items from a message."""
+        prompt = "Extract technology keywords from this text: " + message + "\n\nOutput ONLY a JSON array of technology names, with no other text or explanation.\nFor example: [\"Python\", \"React\", \"AWS\", \"PostgreSQL\"]\n\nDo not include explanations, notes, or anything except the JSON array."
 
         try:
-            if USING_NEW_SDK:
-                response = self.client.chat.completions.create(
-                    model="gpt-3.5-turbo",
-                    messages=prompt,
-                    max_tokens=100,
-                    temperature=0.3
-                )
-                tech_text = response.choices[0].message.content.strip()
-            else:
-                response = openai.ChatCompletion.create(
-                    model="gpt-3.5-turbo",
-                    messages=prompt,
-                    max_tokens=100,
-                    temperature=0.3
-                )
-                tech_text = response.choices[0].message.content.strip()
+            # Call Gemini API
+            response = requests.post(
+                f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-pro:generateContent?key={self.api_key}",
+                json={
+                    "contents": [{
+                        "parts": [{
+                            "text": prompt
+                        }]
+                    }]
+                },
+                timeout=30
+            )
 
-            # Try to parse the response as a Python list
-            try:
-                # Clean up the response - remove quotes, brackets
-                tech_text = tech_text.replace("'", '"')
-                tech_list = json.loads(tech_text)
-                if isinstance(tech_list, list):
-                    return tech_list
-                else:
-                    return [message.strip()]
-            except:
-                # If parsing fails, fall back to basic comma splitting
-                return [item.strip() for item in message.split(',') if item.strip()]
+            # Check for successful response
+            if response.status_code == 200:
+                response_data = response.json()
+
+                # Extract text from Gemini response
+                tech_text = response_data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "[]")
+
+                # Try to parse the response as a JSON array
+                try:
+                    tech_list = json.loads(tech_text)
+                    if isinstance(tech_list, list):
+                        return tech_list
+                    else:
+                        return [message.strip()]
+                except:
+                    # If parsing fails, fall back to basic comma splitting
+                    return [item.strip() for item in message.split(',') if item.strip()]
+            else:
+                logger.error(f"Gemini API error: {response.status_code} - {response.text}")
+                return [message.strip()]
 
         except Exception as e:
-            logger.error(f"Error extracting tech stack with LLM: {e}")
+            logger.error(f"Error extracting tech stack with Gemini: {e}")
             return [message.strip()]
 
     def _generate_contact_request_message(self) -> str:
@@ -330,166 +561,243 @@ class TalentScoutBot:
 
     def _generate_tech_stack_request_message(self) -> str:
         """Generate message asking about tech stack."""
-        return f"""Thank you for that information! Now, I'd like to know about your technical skills.
+        return f"Thank you for that information! Now, I'd like to know about your technical skills.\n\nPlease list the programming languages, frameworks, databases, and tools that you are proficient in.\nFor example: Python, React, AWS, SQL, etc."
 
-Please list the programming languages, frameworks, databases, and tools that you are proficient in.
-For example: Python, React, AWS, SQL, etc."""
+    def _categorize_tech_stack(self, tech_stack: List[str]) -> Dict[str, List[str]]:
+        """Categorize technologies in the tech stack by type."""
+        categorized = {category: [] for category in self.tech_categories.keys()}
+
+        for tech in tech_stack:
+            tech_lower = tech.lower()
+            for category, items in self.tech_categories.items():
+                if any(item == tech_lower or item in tech_lower for item in items):
+                    categorized[category].append(tech)
+                    break
+
+        # Remove empty categories
+        return {k: v for k, v in categorized.items() if v}
 
     def _generate_technical_questions(self) -> str:
-        """Generate technical questions based on the candidate's tech stack."""
+        """Generate technical questions based on the candidate's tech stack using Gemini API."""
         tech_stack = self.candidate_info["tech_stack"]
 
         if not tech_stack or len(tech_stack) == 0:
             return "I don't have information about your technical skills. Could you please share your tech stack with me?"
 
-        # For each item in tech stack, we'll use the LLM to generate questions
         tech_stack_str = ", ".join(tech_stack)
 
-        # We'll use the LLM to generate technical questions
-        prompt = [
-            {
-                "role": "system",
-                "content": f"""
-                You are a technical interviewer for a recruitment agency.
-                Generate 3-5 relevant technical questions to assess the candidate's proficiency in these technologies: {tech_stack_str}.
+        # Check if API is working before attempting to generate questions
+        if not self.api_working or not self.api_key:
+            # If API is not working, use fallback questions
+            categorized_tech = self._categorize_tech_stack(tech_stack)
+            return self._generate_fallback_technical_questions(categorized_tech, tech_stack_str)
 
-                The questions should:
-                1. Be specific to the technologies mentioned
-                2. Be appropriate for an initial screening
-                3. Test both theoretical knowledge and practical experience
-                4. Be challenging but not overly complex
-                5. Be formatted as a numbered list
-
-                DO NOT ask the candidate to write complete code or complex algorithms.
-                """
-            }
-        ]
+        # Direct, simple prompt for generating tech-specific questions
+        prompt = "Generate 4-5 technical interview questions for a candidate with experience in: " + tech_stack_str + "\n\nRequirements for questions:\n1. Each question must specifically mention one of the technologies in their tech stack\n2. Questions should range from medium to hard difficulty\n3. Include at least one scenario-based question where they explain how they'd solve a problem\n4. Questions should test deep knowledge, not just basics\n5. Questions should not be answerable with just yes/no\n\nFormat your response as a clean numbered list with no indentation. Do not include any introductory text or explanations."
 
         try:
-            if USING_NEW_SDK:
-                response = self.client.chat.completions.create(
-                    model="gpt-3.5-turbo",
-                    messages=prompt,
-                    max_tokens=500,
-                    temperature=0.7
-                )
-                questions = response.choices[0].message.content.strip()
+            # Call Gemini API
+            response = requests.post(
+                f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-pro:generateContent?key={self.api_key}",
+                json={
+                    "contents": [{
+                        "parts": [{
+                            "text": prompt
+                        }]
+                    }]
+                },
+                timeout=30
+            )
+
+            # Check for successful response
+            if response.status_code == 200:
+                response_data = response.json()
+
+                # Extract text from Gemini response
+                questions = response_data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+
+                # Remove any indentation from the response to prevent alignment issues
+                questions = "\n\n".join(line.strip() for line in questions.split("\n"))
+
+                return f"Based on your tech stack ({tech_stack_str}), I'd like to ask you a few technical questions:\n\n{questions}\n\nPlease answer these questions to help us assess your technical proficiency."
             else:
-                response = openai.ChatCompletion.create(
-                    model="gpt-3.5-turbo",
-                    messages=prompt,
-                    max_tokens=500,
-                    temperature=0.7
-                )
-                questions = response.choices[0].message.content.strip()
+                logger.error(f"Gemini API error: {response.status_code} - {response.text}")
+                self.api_working = False  # Mark API as not working for future calls
+                # Provide more specific fallback questions based on tech categories
+                categorized_tech = self._categorize_tech_stack(tech_stack)
+                return self._generate_fallback_technical_questions(categorized_tech, tech_stack_str)
 
-            return f"""
-            Based on your tech stack ({tech_stack_str}), I'd like to ask you a few technical questions:
-
-            {questions}
-
-            Please answer these questions to help us assess your technical proficiency.
-            """
         except Exception as e:
             logger.error(f"Error generating technical questions: {e}")
-            return f"""
-            Based on your tech stack ({tech_stack_str}), I'd like to ask you some technical questions:
+            self.api_working = False  # Mark API as not working for future calls
+            # Provide more specific fallback questions based on tech categories
+            categorized_tech = self._categorize_tech_stack(tech_stack)
+            return self._generate_fallback_technical_questions(categorized_tech, tech_stack_str)
 
-            1. Can you describe a challenging project where you used these technologies?
-            2. What is your strongest technical skill, and how have you applied it in your work?
-            3. How do you stay updated with the latest developments in these technologies?
+    def _generate_fallback_technical_questions(self, categorized_tech: Dict[str, List[str]], tech_stack_str: str) -> str:
+        """Generate fallback technical questions if the LLM call fails."""
+        fallback_questions = []
 
-            Please provide brief answers to these questions.
-            """
+        # Generate language-specific questions
+        if "languages" in categorized_tech and categorized_tech["languages"]:
+            primary_language = categorized_tech["languages"][0]
+            fallback_questions.append(f"1. What features or aspects of {primary_language} do you find most useful in your development work? Please provide specific examples.")
 
-    def _generate_closing_message(self) -> str:
-        """Generate closing message."""
+        # Generate frontend-specific questions
+        if "frontend" in categorized_tech and categorized_tech["frontend"]:
+            frontend_tech = categorized_tech["frontend"][0]
+            fallback_questions.append(f"2. Describe a challenging UI/UX problem you solved using {frontend_tech}. What was your approach and what was the outcome?")
+
+        # Generate backend-specific questions
+        if "backend" in categorized_tech and categorized_tech["backend"]:
+            backend_tech = categorized_tech["backend"][0]
+            fallback_questions.append(f"3. How do you handle API security and performance optimization in {backend_tech}? Share some best practices you follow.")
+
+        # Generate database-specific questions
+        if "databases" in categorized_tech and categorized_tech["databases"]:
+            db_tech = categorized_tech["databases"][0]
+            fallback_questions.append(f"4. What strategies do you use for database optimization in {db_tech}? How do you handle large datasets?")
+
+        # Add cloud/deployment question if applicable
+        if "cloud" in categorized_tech and categorized_tech["cloud"]:
+            cloud_tech = categorized_tech["cloud"][0]
+            fallback_questions.append(f"5. How have you used {cloud_tech} in your projects? What services or features do you have the most experience with?")
+
+        # Ensure we have at least 3 questions
+        if len(fallback_questions) < 3:
+            fallback_questions.append("6. Describe a challenging technical project you've worked on recently. What technologies did you use, what problems did you encounter, and how did you solve them?")
+            fallback_questions.append("7. How do you stay updated with the latest developments in your technical field? Which resources do you find most valuable?")
+            fallback_questions.append("8. What is your approach to debugging complex technical issues? Please walk me through your process with a specific example.")
+
+        # Format and return the questions
+        questions_text = "\n\n".join(fallback_questions[:5])  # Limit to 5 questions
+
+        return f"Based on your tech stack ({tech_stack_str}), I'd like to ask you a few technical questions:\n\n{questions_text}\n\nPlease answer these questions to help us assess your technical proficiency."
+
+    def _generate_closing_message(self, message_history=None) -> str:
+        """Generate closing message and save candidate data."""
+        # Save candidate data if we have required info and message_history is provided
+        if message_history and self.candidate_info.get("name") and self.candidate_info.get("email"):
+            self.save_candidate(message_history)
+
         name = self.candidate_info.get("name", "candidate")
         email = self.candidate_info.get("email", "your email")
 
-        return f"""
-        Thank you for taking the time to chat with me, {name}!
+        # Generate timestamp for application
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        I've collected your information for the initial screening process. Here's what I have:
-        - Name: {self.candidate_info.get("name", "Not provided")}
-        - Contact: {self.candidate_info.get("email", "Not provided")}
-        - Experience: {self.candidate_info.get("experience", "Not provided")}
-        - Position interest: {self.candidate_info.get("position", "Not provided")}
-        - Location: {self.candidate_info.get("location", "Not provided")}
-        - Tech stack: {", ".join(self.candidate_info.get("tech_stack", ["Not provided"]))}
-
-        A TalentScout recruiter will review your details and get back to you soon via {email}.
-
-        If you have any questions in the meantime, feel free to reach out to our recruitment team at recruitment@talentscout.example.com
-
-        Have a great day!
-        """
+        return f"Thank you for taking the time to chat with me, {name}!\n\nI've collected your information for the initial screening process. Here's what I have:\n- Name: {self.candidate_info.get('name', 'Not provided')}\n- Contact: {self.candidate_info.get('email', 'Not provided')}\n- Experience: {self.candidate_info.get('experience', 'Not provided')}\n- Position interest: {self.candidate_info.get('position', 'Not provided')}\n- Location: {self.candidate_info.get('location', 'Not provided')}\n- Tech stack: {', '.join(self.candidate_info.get('tech_stack', ['Not provided']))}\n\nYour application has been recorded at {timestamp}.\n\nA TalentScout recruiter will review your details and get back to you soon via {email}.\n\nIf you have any questions in the meantime, feel free to reach out to our recruitment team at recruitment@talentscout.example.com\n\nHave a great day!"
 
     def _generate_llm_response(self, user_message: str, message_history: List[Dict[str, str]]) -> str:
-        """Generate response using LLM when a more contextual response is needed."""
-        # Create prompt based on conversation history and stage
-        prompt = self._create_prompt_for_stage(user_message, message_history)
+        """Generate response using Gemini API when a more contextual response is needed."""
+        if not self.api_working or not self.api_key:
+            return "I'm not sure how to respond to that. Let's continue with the screening process."
+
+        # Create a conversation prompt based on history and stage
+        prompt = self._create_prompt_for_gemini(user_message, message_history)
 
         try:
-            # Call LLM API using appropriate SDK version
-            if USING_NEW_SDK:
-                response = self.client.chat.completions.create(
-                    model="gpt-3.5-turbo",
-                    messages=prompt,
-                    max_tokens=300,
-                    temperature=0.7
-                )
-                return response.choices[0].message.content.strip()
+            # Call Gemini API
+            response = requests.post(
+                f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-pro:generateContent?key={self.api_key}",
+                json={
+                    "contents": [{
+                        "parts": [{
+                            "text": prompt
+                        }]
+                    }]
+                },
+                timeout=30
+            )
+
+            # Check for successful response
+            if response.status_code == 200:
+                response_data = response.json()
+
+                # Extract text from Gemini response
+                response_text = response_data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+
+                return response_text
             else:
-                response = openai.ChatCompletion.create(
-                    model="gpt-3.5-turbo",
-                    messages=prompt,
-                    max_tokens=300,
-                    temperature=0.7
-                )
-                return response.choices[0].message.content
+                logger.error(f"Gemini API error: {response.status_code} - {response.text}")
+                self.api_working = False
+                return "I'm not sure how to respond to that. Let's continue with the screening process."
+
         except Exception as e:
-            logger.error(f"Error calling LLM: {e}")
-            return "I apologize, but I'm having trouble generating a response. Could you please repeat that?"
+            logger.error(f"Error calling Gemini API: {e}")
+            self.api_working = False
+            return "I'm not sure how to respond to that. Let's continue with the screening process."
 
-    def _create_prompt_for_stage(self, user_message: str, message_history: List[Dict[str, str]]) -> List[Dict[str, str]]:
-        """Create a prompt for the LLM based on current conversation stage."""
-        # System message sets the context for the LLM
-        system_message = {
-            "role": "system",
-            "content": f"""
-            You are a hiring assistant for TalentScout, a recruitment agency specializing in technology placements.
-            Your task is to conduct an initial screening of candidates by gathering information and asking relevant technical questions.
+    def _create_prompt_for_gemini(self, user_message: str, message_history: List[Dict[str, str]]) -> str:
+        """Create a prompt for Gemini based on current conversation stage."""
+        # Create system context
+        system_context = f"You are a hiring assistant for TalentScout, a recruitment agency specializing in technology placements.\nYour task is to conduct an initial screening of candidates by gathering information and asking relevant technical questions.\n\nCurrent conversation stage: {self.current_stage}\nCurrent candidate information: {json.dumps(self.candidate_info, indent=2)}\n\nFocus on gathering the information needed for the current stage and then move to the next stage.\nBe professional, friendly, and concise in your responses.\nMaintain the conversation in the context of a job application process."
 
-            Current conversation stage: {self.current_stage}
-            Current candidate information: {self.candidate_info}
+        # Add conversation history
+        conversation_history = "\n\n--- Previous Messages ---\n"
+        for message in message_history[-5:]:  # Use last 5 messages to avoid token limits
+            role = "User" if message.get("role", "") == "user" else "Assistant"
+            conversation_history += f"{role}: {message.get('content', '')}\n"
 
-            Focus on gathering the information needed for the current stage and then move to the next stage.
-            Be professional, friendly, and concise in your responses.
-            Maintain the conversation in the context of a job application process.
-            """
-        }
+        # Combine everything into a final prompt
+        final_prompt = f"{system_context}\n\n{conversation_history}\n\nUser: {user_message}\n\nYour response:"
 
-        # Prepare conversation history for the prompt
-        prompt_messages = [system_message]
+        return final_prompt
 
-        # Add relevant conversation history
-        for message in message_history[-10:]:  # Use last 10 messages to avoid token limits
-            prompt_messages.append({
-                "role": message["role"],
-                "content": message["content"]
-            })
 
-        # Add the current user message
-        prompt_messages.append({
-            "role": "user",
-            "content": user_message
-        })
+def test_gemini_api():
+    """Test the Gemini API connection."""
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        print("⚠️ No Gemini API key found in environment variables.")
+        return False
 
-        return prompt_messages
+    try:
+        # Simple test request
+        response = requests.post(
+            f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-pro:generateContent?key={api_key}",
+            json={
+                "contents": [{
+                    "parts": [{
+                        "text": "Hello, please respond with the text 'API working properly'"
+                    }]
+                }]
+            },
+            timeout=10
+        )
+
+        if response.status_code == 200:
+            print("✅ Gemini API connection successful!")
+            return True
+        else:
+            print(f"❌ Gemini API error: {response.status_code} - {response.text}")
+            return False
+    except Exception as e:
+        print(f"❌ Gemini API connection failed: {e}")
+        return False
 
 
 if __name__ == "__main__":
-    # Simple test code to verify the chatbot works
+    # Initialize database
+    db = CandidateDatabase()
+
+    # Test the API connection
+    api_working = test_gemini_api()
+
+    # Print current version info
+    print(f"TalentScout Hiring Assistant v2.0.0")
+    print(f"Current time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # Simple test for the chatbot
     bot = TalentScoutBot()
-    print(bot.get_greeting())
+    greeting = bot.get_greeting()
+    print("\n" + greeting)
+
+    # Test conversation flow
+    if api_working:
+        print("\nAPI is working properly. The chatbot will use the Gemini API to generate responses.")
+    else:
+        print("\nAPI is not working. The chatbot will use fallback responses.")
+
+    print("Database storage: Enabled")
+    print("\nSystem ready to process candidate conversations.")
